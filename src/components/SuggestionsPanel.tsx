@@ -49,7 +49,7 @@ export function SuggestionsPanel({ items, apps, scanMessage, lastScanAt, onAccep
         {items.length > 0 && (
           <div className="inbox-actions">
             <button className="btn sm" type="button" disabled={!!busy} onClick={() => run("all", onDismissAll)}>Dismiss all</button>
-            <button className="btn sm primary" type="button" disabled={!!busy} onClick={() => run("all", onAcceptConfident)}>Accept all confident</button>
+            <button className="btn sm primary" type="button" disabled={!!busy} onClick={() => run("all", onAcceptConfident)}>Accept all strong matches</button>
           </div>
         )}
       </div>
@@ -63,7 +63,7 @@ export function SuggestionsPanel({ items, apps, scanMessage, lastScanAt, onAccep
             <div className="what">
               <div>
                 <b>{s.company}</b>
-                {role && <span className="role"> · {role}</span>}
+                {(role || s.jobTitle) && <span className="role"> · {role || s.jobTitle}</span>}
                 {change && <span className="mono"> {change}</span>}
               </div>
               <div className="sum">{s.summary}</div>
@@ -71,6 +71,7 @@ export function SuggestionsPanel({ items, apps, scanMessage, lastScanAt, onAccep
                 <span>{fmtDate(s.emailDate)}</span>
                 <span title={s.emailFrom}>{s.emailSubject.length > 70 ? s.emailSubject.slice(0, 70) + "…" : s.emailSubject}</span>
                 <a href={s.emailUrl} target="_blank" rel="noopener noreferrer">Open email ↗</a>
+                {s.match && <span className={`match ${s.match}`} title={s.matchReason}>{s.match === "strong" ? "Strong match" : s.match === "possible" ? "Possible match" : "Tracked application"}</span>}
                 {s.confidence === "unsure" && <span className="unsure">check this one</span>}
               </div>
             </div>

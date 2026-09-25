@@ -12,7 +12,9 @@ A job application tracker that runs entirely in your browser. Track every applic
 - Filter by stage, search, and sort; deadlines for assessments shown up front
 - **Scan Gmail**: finds recruiting emails since your last scan, groups them per job, and queues suggestions such as "Rejection email on 16 Sep" or "Assessment invite, due about 28 Sep"
 - Review panel with Accept, Dismiss, "Accept all confident", and a link to open each source email
-- Rules never move a rejected application back to an earlier stage, and skip job alerts, newsletters and any keywords you list (for example part-time roles)
+- **Job Preferences** decide what gets suggested: role categories (software, AI/ML, data, cloud, security, tech consulting, graduate tech) plus your own keywords, excluded job types (stock taker, retail, warehouse… editable), employment types, optional preferred companies and locations. Each suggestion is labelled "Strong match" or "Possible match"; weak matches are never shown
+- Rules never move a rejected application back to an earlier stage, and skip job alerts and newsletters
+- Light, dark or system theme, remembered between visits
 - Backup and restore as JSON, export to CSV
 - Works on phones; follows your light or dark theme
 
@@ -72,6 +74,12 @@ Anyone can use a hosted copy with **their own** client ID: they add the site's o
 
 Rules are simpler than an AI model, so each suggestion links to its source email and uncertain ones are flagged "check this one". Improvements to the patterns are very welcome; add a test in `src/gmail/classify.test.ts` with each change.
 
+## Gmail quota
+
+Gmail limits each user to about 250 quota units per second. A scan makes 1 search call plus 1 small metadata call per email not seen before (5 units each), capped at 25/50/100 emails (Settings → Gmail connection), and reads at most 15 full emails when the preview isn't enough. Requests run 2 at a time with a minimum gap between them, and rate-limit responses are retried after 1, 2 and 4 seconds before the scan stops with a clear message. Every email fetched is cached in the browser, so an interrupted scan resumes without re-downloading, and clicking Scan again within 2 minutes shows the last result without calling Gmail.
+
+To see scan progress in the browser console, run `localStorage.setItem("job-tracker-debug", "1")`. Only counts are logged, never email content or tokens.
+
 ## Privacy and security
 
 - Access token is kept in memory only and expires after about an hour. Click **Connect Gmail** to renew it. No refresh token is stored.
@@ -108,7 +116,11 @@ src/
   gmail/auth.ts           Google sign-in with the user's client ID
   gmail/api.ts            read-only Gmail REST calls
   gmail/classify.ts       rules engine (outcome, company, role, deadline)
-  gmail/scan.ts           search → classify → suggestions; accept/dismiss
+  gmail/scan.ts           search → classify → filter → suggestions; accept/dismiss
+  gmail/errors.ts         quota vs disabled-API vs sign-in error handling
+  jobs/preferences.ts     role categories, exclusions and defaults
+  jobs/evaluate.ts        job title/type/location extraction and relevance score
+  lib/theme.ts            light / dark / system theme
   db.ts                   IndexedDB tables
 docs/google-setup.md      detailed Google Cloud walkthrough
 ```

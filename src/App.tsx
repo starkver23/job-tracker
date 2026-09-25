@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useLiveQuery } from "dexie-react-hooks";
 import { db, getKV, newId, setKV } from "./db";
 import { STAGES, STAGE_LABEL } from "./stages";
@@ -7,13 +7,16 @@ import { useToast } from "./lib/toast";
 import { loadSettings, saveSettings } from "./settings";
 import { AuthError, connect, disconnect, forgetToken, getToken } from "./gmail/auth";
 import { GmailError, getProfile } from "./gmail/api";
-import { acceptSuggestion, dismissSuggestion, runScan } from "./gmail/scan";
+import { gmailErrorMessage } from "./gmail/errors";
+import { CACHE_WINDOW_MS, ScanBusyError, acceptSuggestion, dismissSuggestion, resetScanHistory, runScan } from "./gmail/scan";
 import { AppForm } from "./components/AppForm";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
-import { SettingsDialog } from "./components/SettingsDialog";
+import { SettingsDialog, type SettingsTab } from "./components/SettingsDialog";
+import { ScanStatus, type ScanState } from "./components/ScanStatus";
+import { ThemeToggle } from "./components/ThemeToggle";
 import { BackupDialog } from "./components/BackupDialog";
 import { EXAMPLES } from "./examples";
-import type { Application, Settings, Stage, Suggestion } from "./types";
+import type { Application, ScanSummary, Settings, Stage, Suggestion } from "./types";
 
 type Filter = "all" | Stage;
 type SortKey = "stage" | "company" | "applied" | "updated";
@@ -30,8 +33,11 @@ export default function App() {
   const [sort, setSort] = useState<SortKey>("stage");
   const [editing, setEditing] = useState<{ app: Application | null; askDelete?: boolean } | null>(null);
   const [dialog, setDialog] = useState<"settings" | "backup" | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("prefs");
   const [scanning, setScanning] = useState(false);
-  const [scanMessage, setScanMessage] = useState("");
+  const [scanState, setScanState] = useState<ScanState>({ phase: "idle" });
+  // A ref, not state: it flips synchronously, so a double click can't start two scans.
+  const scanningRef = useRef(false);
   const { toast, toastNode } = useToast();
 
   const list = apps ?? [];
@@ -91,47 +97,57 @@ export default function App() {
     return t;
   }, [settings.clientId, account]);
 
-  const scan = async () => {
+  const openSettings = (tab: SettingsTab) => {
+    setSettingsTab(tab);
+    setDialog("settings");
+  };
+
+  /** Runs only from a click on "Scan Gmail". Never on load, sign-in or settings changes. */
+  const scan = async (force = false) => {
+    if (scanningRef.current) return;
+    if (!settings.clientId) {
+      openSettings("gmail");
+      return;
+    }
+    if (!force) {
+      const last = await getKV<ScanSummary | null>("lastScanSummary", null);
+      if (last && Date.now() - last.at < CACHE_WINDOW_MS) {
+        setScanState({ phase: "done", summary: last, cached: true });
+        return;
+      }
+    }
+    scanningRef.current = true;
     setScanning(true);
-    setScanMessage("Connecting to Gmail…");
+    setScanState({ phase: "scanning", message: "Connecting to Gmail…" });
+    const progress = (message: string) => setScanState({ phase: "scanning", message });
     try {
       let token = await ensureToken();
       if (!token) {
-        setScanMessage("");
+        setScanState({ phase: "idle" });
         return;
       }
       const acct = account || (await getKV<string>("account", ""));
-      let result;
+      let summary: ScanSummary;
       try {
-        result = await runScan(token, settings, acct, setScanMessage);
+        summary = await runScan(token, settings, acct, progress);
       } catch (e) {
-        if (e instanceof GmailError && e.status === 401) {
+        // Token expired mid-session: reconnect once. Already-fetched emails are cached, so nothing is refetched.
+        if (e instanceof GmailError && e.kind === "auth") {
           forgetToken();
           token = await ensureToken();
           if (!token) return;
-          result = await runScan(token, settings, acct, setScanMessage);
+          summary = await runScan(token, settings, acct, progress);
         } else throw e;
       }
-      setScanMessage(
-        result.suggestions
-          ? ""
-          : result.checked
-            ? `Checked ${result.checked} email thread${result.checked > 1 ? "s" : ""}. Nothing needs updating.`
-            : "No new recruiting emails since the last scan.",
-      );
-      if (result.suggestions) toast(`${result.suggestions} new suggestion${result.suggestions > 1 ? "s" : ""}`);
+      setScanState({ phase: "done", summary });
+      if (summary.relevant.length) toast(`${summary.relevant.length} new suggestion${summary.relevant.length > 1 ? "s" : ""}`);
     } catch (e) {
-      if (e instanceof AuthError) setScanMessage(e.message);
-      else if (e instanceof GmailError) {
-        setScanMessage(
-          e.status === 403
-            ? `Gmail refused the request: ${e.message}. Check that the Gmail API is enabled in your Google Cloud project.`
-            : e.status === 429
-              ? "Gmail is rate-limiting requests. Wait a minute and try again."
-              : `Gmail error: ${e.message}`,
-        );
-      } else setScanMessage("Something went wrong while scanning. Check your connection and try again.");
+      if (e instanceof ScanBusyError) return;
+      if (e instanceof AuthError) setScanState({ phase: "error", message: e.message });
+      else if (e instanceof GmailError) setScanState({ phase: "error", message: gmailErrorMessage(e), rateLimited: e.kind === "rate_limit" });
+      else setScanState({ phase: "error", message: "Something went wrong while scanning. Check your connection and try again. Your saved applications are safe." });
     } finally {
+      scanningRef.current = false;
       setScanning(false);
     }
   };
@@ -144,7 +160,7 @@ export default function App() {
     await dismissSuggestion(s);
   };
   const acceptConfident = async () => {
-    const targets = pending.filter((s) => s.confidence !== "unsure");
+    const targets = pending.filter((s) => s.confidence !== "unsure" && s.match !== "possible");
     for (const s of targets) await acceptSuggestion(s, newId);
     toast(`Accepted ${targets.length}`);
   };
@@ -200,29 +216,45 @@ export default function App() {
   return (
     <div className="wrap">
       <header className="head">
-        <div>
+        <div className="brand">
           <h1>Job Application Tracker</h1>
           <p className="sub">Every application, where it stands, and what's next. Stored only in this browser.</p>
         </div>
-        <div className="head-actions">
-          {account && (
-            <span className="account" title="Connected Gmail account">
-              <span className={`dot ${getToken() ? "live" : ""}`} />
-              {account}
-            </span>
-          )}
-          <button className="btn" type="button" onClick={() => setDialog("settings")}>Settings</button>
-          <button className="btn" type="button" onClick={() => setDialog("backup")}>Backup</button>
-          <button className="btn" type="button" onClick={scan} disabled={scanning}>
-            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="3" width="13" height="10" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.6" /><path d="M2 4l6 5 6-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" /></svg>
-            {scanning ? "Scanning…" : settings.clientId ? (account ? "Scan Gmail" : "Connect Gmail") : "Set up Gmail"}
+        <div className="head-tools">
+          <ThemeToggle />
+          <button className="btn" type="button" onClick={() => openSettings("prefs")} aria-label="Settings">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.3" fill="none" stroke="currentColor" strokeWidth="1.6" /><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg>
+            <span className="lbl">Settings</span>
           </button>
-          <button className="btn primary" type="button" onClick={() => setEditing({ app: null })}>
-            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 1v12M1 7h12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
-            Add application
+          <button className="btn" type="button" onClick={() => setDialog("backup")} aria-label="Backup and restore">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.5L8 10l3.5-3.5M2.5 11.5v2h11v-2" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            <span className="lbl">Backup</span>
           </button>
         </div>
+        <div className="head-primary">
+          <span className="account" title="Gmail account">
+            <span className={`dot ${account && getToken() ? "live" : ""}`} aria-hidden="true" />
+            {account ? account : settings.clientId ? "Gmail not connected" : "Gmail not set up"}
+          </span>
+          <div className="actions">
+            <button className="btn" type="button" onClick={() => scan()} disabled={scanning} aria-busy={scanning}>
+              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="3" width="13" height="10" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.6" /><path d="M2 4l6 5 6-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" /></svg>
+              {scanning ? "Scanning Gmail…" : settings.clientId ? "Scan Gmail" : "Set up Gmail"}
+            </button>
+            <button className="btn primary" type="button" onClick={() => setEditing({ app: null })}>
+              <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 1v12M1 7h12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+              Add application
+            </button>
+          </div>
+        </div>
       </header>
+
+      <ScanStatus
+        state={scanState}
+        onClose={() => setScanState({ phase: "idle" })}
+        onChangePrefs={() => openSettings("prefs")}
+        onForceScan={() => scan(true)}
+      />
 
       {hasExamples && (
         <div className="banner">
@@ -234,7 +266,7 @@ export default function App() {
       <SuggestionsPanel
         items={pending}
         apps={list}
-        scanMessage={scanMessage}
+        scanMessage=""
         lastScanAt={lastScanAt}
         onAccept={accept}
         onDismiss={dismiss}
@@ -251,7 +283,7 @@ export default function App() {
           </p>
           <div className="row">
             <button className="btn primary" type="button" onClick={() => setEditing({ app: null })}>Add application</button>
-            <button className="btn" type="button" onClick={scan} disabled={scanning}>{settings.clientId ? "Connect Gmail" : "Set up Gmail"}</button>
+            <button className="btn" type="button" onClick={() => scan()} disabled={scanning}>{settings.clientId ? "Scan Gmail" : "Set up Gmail"}</button>
             <button className="btn" type="button" onClick={loadExamples}>Try with example rows</button>
           </div>
         </div>
@@ -366,6 +398,7 @@ export default function App() {
         <SettingsDialog
           settings={settings}
           account={account}
+          initialTab={settingsTab}
           toast={toast}
           onSave={onSaveSettings}
           onClose={() => setDialog(null)}
@@ -376,8 +409,7 @@ export default function App() {
             setDialog(null);
           }}
           onResetScan={async () => {
-            await db.handled.clear();
-            await setKV("lastScanAt", 0);
+            await resetScanHistory();
             toast("Next scan will re-read your inbox");
           }}
         />
@@ -393,7 +425,7 @@ export default function App() {
             setDialog(null);
           }}
           onWipe={async () => {
-            await Promise.all([db.applications.clear(), db.suggestions.clear(), db.handled.clear(), setKV("lastScanAt", 0)]);
+            await Promise.all([db.applications.clear(), db.suggestions.clear(), resetScanHistory()]);
             toast("Everything deleted");
             setDialog(null);
           }}

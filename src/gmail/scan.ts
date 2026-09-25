@@ -1,17 +1,31 @@
 import { classify, normCompany, type Classified } from "./classify";
-import { getThreadFull, getThreadMeta, header, mapLimit, plainBody, searchThreadIds, threadUrl, type GmailMessage } from "./api";
+import { cancelPendingRequests, getMessageBody, getMessageMeta, header, listMessageIds, mapLimit, plainBody, resetRequestCount, getRequestCount, threadUrl, type GmailMessage } from "./api";
 import { db, getKV, setKV } from "../db";
 import { isForward, laterStage, STAGE_LABEL } from "../stages";
-import type { AppChanges, Application, EmailInput, Settings, Suggestion } from "../types";
+import { evaluateJob, extractJobInfo, extractTitle, type JobInfo } from "../jobs/evaluate";
+import type { JobPreferences } from "../jobs/preferences";
+import { scanLog } from "../lib/log";
+import type { AppChanges, Application, EmailInput, ScanSummary, Settings, Suggestion } from "../types";
 
-/** Gmail search that catches most recruiting mail while skipping promotions. */
+/**
+ * Gmail search that narrows candidates on Google's side. One messages.list call
+ * costs the same whatever the query length, so a single focused query with a
+ * date bound beats several smaller queries.
+ */
 export const RECRUITING_QUERY =
-  '-category:promotions -category:social -in:sent (subject:(application OR applying OR applied OR assessment OR interview OR candidacy OR offer OR "next steps") OR "thank you for applying" OR "thank you for your application" OR "online assessment" OR "video interview" OR unfortunately)';
+  '-category:promotions -category:social -in:sent -in:chats (subject:(application OR applying OR applied OR assessment OR interview OR candidacy OR offer OR "next steps") OR "thank you for applying" OR "thank you for your application" OR "online assessment" OR "video interview" OR unfortunately)';
+
+/** Most bodies we'll fetch in one scan (only for vague emails or jobs with no visible title). */
+export const MAX_BODY_FETCHES = 15;
+/** Clicking Scan again within this window shows the cached result instead of calling Gmail. */
+export const CACHE_WINDOW_MS = 2 * 60 * 1000;
 
 export interface ClassifiedEmail {
   email: EmailInput;
   c: Classified;
   url: string;
+  msgId?: string;
+  job?: JobInfo;
 }
 
 const decodeEntities = (s: string) =>
@@ -59,9 +73,17 @@ function findApp(apps: Application[], company: string, role: string): Applicatio
 
 /**
  * Pure step: fold classified emails into suggestions against the current tracker.
- * Emails about the same company (and role) become one suggestion.
+ * Emails about the same company (and role) become one suggestion. When `prefs`
+ * is given, each job goes through the Job Preferences filter and only relevant
+ * ones are returned; the rest are reported through `onSkip`.
  */
-export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], now = Date.now()): Suggestion[] {
+export function buildSuggestions(
+  items: ClassifiedEmail[],
+  apps: Application[],
+  now = Date.now(),
+  opts: { prefs?: JobPreferences; onSkip?: (s: { company: string; title: string; reason: string }) => void } = {},
+): Suggestion[] {
+  const roleOf = (i: ClassifiedEmail) => i.c.role || i.job?.title || "";
   const relevant = items.filter((i) => i.c.relevant && i.c.company).sort((a, b) => a.email.date.localeCompare(b.email.date));
 
   // group by company, then split by role when one company has several named roles
@@ -72,7 +94,7 @@ export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], 
   }
   const groups: ClassifiedEmail[][] = [];
   for (const list of byCompany.values()) {
-    const roles = [...new Set(list.map((i) => i.c.role.toLowerCase()).filter(Boolean))];
+    const roles = [...new Set(list.map((i) => roleOf(i).toLowerCase()).filter(Boolean))];
     if (roles.length <= 1) {
       groups.push(list);
       continue;
@@ -80,7 +102,7 @@ export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], 
     const byRole = new Map<string, ClassifiedEmail[]>(roles.map((r) => [r, []]));
     let lastRole = roles[0];
     for (const i of list) {
-      const r = i.c.role.toLowerCase() || lastRole;
+      const r = roleOf(i).toLowerCase() || lastRole;
       lastRole = r;
       byRole.get(r)!.push(i);
     }
@@ -92,7 +114,7 @@ export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], 
     const latest = g[g.length - 1];
     let status = g[0].c.status;
     for (const i of g.slice(1)) status = laterStage(status, i.c.status);
-    const role = [...g].reverse().find((i) => i.c.role)?.c.role || "";
+    const role = [...g].reverse().map(roleOf).find(Boolean) || "";
     const company = latest.c.company;
     const appliedEmail = g.find((i) => i.c.status === "applied");
     const appliedOn = appliedEmail?.email.date || "";
@@ -103,10 +125,26 @@ export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], 
     const confidence = g.some((i) => i.c.confidence === "unsure") && latest.c.confidence === "unsure" ? "unsure" : "sure";
 
     const match = findApp(apps, company, role);
+
+    // Job Preferences filter
+    let evaluation: ReturnType<typeof evaluateJob> | null = null;
+    let info: JobInfo | null = null;
+    if (opts.prefs) {
+      const head = g.flatMap((i) => [i.email.subject, i.email.snippet]);
+      const body = g.map((i) => i.email.body || "").join("\n");
+      info = extractJobInfo(head, body, role);
+      evaluation = evaluateJob({ company, info, subject: head.join("\n"), body, tracked: !!match }, opts.prefs);
+      if (!evaluation.include) {
+        opts.onSkip?.({ company, title: info.title, reason: evaluation.reason });
+        continue;
+      }
+    }
+    const title = role || info?.title || "";
+
     const changes: AppChanges = {};
     if (match) {
       if (isForward(match.status, status)) changes.status = status;
-      if (!match.role && role) changes.role = role;
+      if (!match.role && title) changes.role = title;
       if (!match.appliedOn && appliedOn) changes.appliedOn = appliedOn;
       if (oaDone && !match.oaDone) changes.oaDone = true;
       if (changes.status === "oa_todo" || changes.status === "interview") {
@@ -115,13 +153,14 @@ export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], 
       }
       if (!Object.keys(changes).length) continue; // nothing new for this row
     } else {
-      Object.assign(changes, { company, role, status, appliedOn, oaDone });
+      Object.assign(changes, { company, role: title, status, appliedOn, oaDone });
       if (nextStep) changes.nextStep = nextStep;
       if (dueOn) changes.dueOn = dueOn;
+      if (info?.url) changes.link = info.url;
     }
 
-    out.push({
-      id: `g-${latest.email.threadId}-${g.length}`,
+    const s: Suggestion = {
+      id: `g-${latest.msgId || latest.email.threadId}`,
       kind: match ? "update" : "new",
       appId: match?.id,
       company: match?.company || company,
@@ -135,15 +174,28 @@ export function buildSuggestions(items: ClassifiedEmail[], apps: Application[], 
       confidence,
       state: "pending",
       createdAt: now,
-    });
+    };
+    if (evaluation && evaluation.label !== "none") {
+      s.match = evaluation.label;
+      s.matchScore = evaluation.score;
+      s.matchReason = evaluation.reason;
+      s.category = evaluation.category;
+    }
+    if (info) {
+      if (info.title) s.jobTitle = info.title;
+      if (info.employment.length) s.employment = info.employment;
+      if (info.location) s.location = info.location;
+      if (info.url) s.jobUrl = info.url;
+    }
+    out.push(s);
   }
   return out;
 }
 
-function toEmail(m: GmailMessage, threadId: string): EmailInput {
+function toEmail(m: GmailMessage): EmailInput {
   const ms = Number(m.internalDate) || Date.parse(header(m, "Date")) || Date.now();
   return {
-    threadId,
+    threadId: m.threadId,
     from: header(m, "From"),
     subject: decodeEntities(header(m, "Subject")),
     snippet: decodeEntities(m.snippet || ""),
@@ -151,71 +203,140 @@ function toEmail(m: GmailMessage, threadId: string): EmailInput {
   };
 }
 
-export interface ScanResult {
-  checked: number;
-  suggestions: number;
-  skipped: number;
+export class ScanBusyError extends Error {
+  constructor() {
+    super("A Gmail scan is already running.");
+    this.name = "ScanBusyError";
+  }
 }
 
-/** Search, read, classify and queue suggestions. Writes only to this browser's database. */
+let scanRunning = false;
+export const isScanRunning = () => scanRunning;
+
+/**
+ * Search, read, classify and queue suggestions. Writes only to this browser's database.
+ *
+ * API use per scan: 1 messages.list (≤ maxEmails ids) + 1 metadata get per message
+ * not seen before + at most MAX_BODY_FETCHES body gets. Every fetched message is
+ * cached locally straight away, so a scan that stops part-way (for example on a
+ * rate limit) never re-downloads what it already has.
+ */
 export async function runScan(
   token: string,
   settings: Settings,
   account: string,
   onProgress: (msg: string) => void,
-): Promise<ScanResult> {
-  const lastScanAt = await getKV<number>("lastScanAt", 0);
-  const startMs = lastScanAt ? lastScanAt - 86_400_000 : Date.now() - settings.firstScanDays * 86_400_000;
-  const d = new Date(startMs);
-  const after = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+): Promise<ScanSummary> {
+  if (scanRunning) throw new ScanBusyError();
+  scanRunning = true;
+  resetRequestCount();
+  try {
+    scanLog("Gmail scan started");
+    const lastScanAt = await getKV<number>("lastScanAt", 0);
+    const startMs = lastScanAt ? lastScanAt - 86_400_000 : Date.now() - settings.firstScanDays * 86_400_000;
+    const d = new Date(startMs);
+    const after = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
 
-  onProgress("Searching your inbox…");
-  const ids = await searchThreadIds(token, `after:${after} ${RECRUITING_QUERY}`, 200);
-  const handled = new Set((await db.handled.bulkGet(ids)).filter(Boolean).map((h) => h!.threadId));
-  const fresh = ids.filter((id) => !handled.has(id));
+    onProgress("Scanning Gmail…");
+    const refs = await listMessageIds(token, `after:${after} ${RECRUITING_QUERY}`, settings.maxEmails);
+    scanLog(`Gmail search completed: ${refs.length} candidates`);
 
-  let done = 0;
-  onProgress(fresh.length ? `Reading ${fresh.length} email thread${fresh.length > 1 ? "s" : ""}…` : "No new emails.");
-  const me = account.toLowerCase();
-  const perThread = await mapLimit(fresh, 5, async (id) => {
-    const t = await getThreadMeta(token, id);
-    done++;
-    if (done % 10 === 0) onProgress(`Reading emails… ${done} of ${fresh.length}`);
-    return (t.messages || [])
-      .filter((m) => !me || !header(m, "From").toLowerCase().includes(me))
-      .map((m) => ({ m, email: toEmail(m, id) }));
-  });
+    // Deduplicate against every message this browser has already fetched.
+    const known = await db.processedMessages.bulkGet(refs.map((r) => r.id));
+    const cachedPending = known.filter((k): k is NonNullable<typeof k> => !!k && !k.done && !!k.meta);
+    const fresh = refs.filter((_, i) => !known[i]);
+    const skippedKnown = refs.length - fresh.length - cachedPending.length;
+    if (skippedKnown > 0) scanLog(`Skipped ${skippedKnown} already processed message(s)`);
+    if (cachedPending.length) scanLog(`Reusing ${cachedPending.length} message(s) fetched by an unfinished scan`);
 
-  const items: ClassifiedEmail[] = [];
-  const vague: { id: string; msgId: string; email: EmailInput }[] = [];
-  for (const list of perThread) {
-    for (const { m, email } of list) {
-      const c = classify(email, settings.skipKeywords);
-      if (c.needsBody) vague.push({ id: email.threadId, msgId: m.id, email });
-      else items.push({ email, c, url: threadUrl(email.threadId, account) });
-    }
-  }
-
-  if (vague.length) {
-    onProgress(`Reading ${vague.length} unclear email${vague.length > 1 ? "s" : ""} in full…`);
-    await mapLimit(vague, 4, async (v) => {
-      const full = await getThreadFull(token, v.id);
-      const msg = full.messages?.find((x) => x.id === v.msgId);
-      const email = { ...v.email, body: msg ? plainBody(msg).slice(0, 4000) : "" };
-      items.push({ email, c: classify(email, settings.skipKeywords), url: threadUrl(v.id, account) });
+    onProgress(fresh.length ? "Looking for relevant job applications…" : "Checking for new job emails…");
+    const me = account.toLowerCase();
+    type Entry = { id: string; email: EmailInput; url: string };
+    const entries: Entry[] = cachedPending.map((k) => ({ id: k.id, email: k.meta!, url: k.url || threadUrl(k.meta!.threadId, account) }));
+    await mapLimit(fresh, 2, async (r, i) => {
+      scanLog(`Fetching metadata for candidate ${i + 1}/${fresh.length}`);
+      const m = await getMessageMeta(token, r.id);
+      const email = toEmail(m);
+      const url = threadUrl(m.threadId, account);
+      const fromMe = !!me && email.from.toLowerCase().includes(me);
+      await db.processedMessages.put({ id: r.id, at: Date.now(), done: fromMe, meta: fromMe ? undefined : email, url });
+      if (!fromMe) entries.push({ id: r.id, email, url });
+      if ((i + 1) % 10 === 0) onProgress(`Looking for relevant job applications… ${i + 1} of ${fresh.length}`);
     });
+
+    const apps = await db.applications.toArray();
+    const items: ClassifiedEmail[] = [];
+    const needBody: { entry: Entry; priority: number }[] = [];
+    for (const e of entries) {
+      const c = classify(e.email, []);
+      if (e.email.body !== undefined) {
+        items.push({ email: e.email, c, url: e.url, msgId: e.id, job: extractJobInfo([e.email.subject, e.email.snippet], e.email.body, c.role) });
+        continue;
+      }
+      if (c.needsBody) {
+        needBody.push({ entry: e, priority: 0 });
+        continue;
+      }
+      items.push({ email: e.email, c, url: e.url, msgId: e.id, job: extractJobInfo([e.email.subject, e.email.snippet], "", c.role) });
+      // A new job with no visible title: read the body so the role can be checked.
+      const tracked = c.company && apps.some((a) => !a.example && normCompany(a.company) === normCompany(c.company));
+      if (c.relevant && !tracked && !c.role && !extractTitle([e.email.subject, e.email.snippet])) needBody.push({ entry: e, priority: 1 });
+    }
+
+    const toFetch = needBody.sort((a, b) => a.priority - b.priority).slice(0, MAX_BODY_FETCHES);
+    if (toFetch.length) onProgress(`Reading ${toFetch.length} email${toFetch.length > 1 ? "s" : ""} in more detail…`);
+    await mapLimit(toFetch, 2, async ({ entry }, i) => {
+      scanLog(`Fetching body ${i + 1}/${toFetch.length}`);
+      const full = await getMessageBody(token, entry.id);
+      const body = plainBody(full).slice(0, 4000);
+      const email = { ...entry.email, body };
+      await db.processedMessages.update(entry.id, { meta: email });
+      const c = classify(email, []);
+      const idx = items.findIndex((x) => x.msgId === entry.id);
+      const item = { email, c, url: entry.url, msgId: entry.id, job: extractJobInfo([email.subject, email.snippet], body, c.role) };
+      if (idx >= 0) items[idx] = item;
+      else items.push(item);
+    });
+    // Vague emails we couldn't read this time are still classified from the preview.
+    for (const { entry } of needBody.slice(MAX_BODY_FETCHES)) {
+      if (!items.some((x) => x.msgId === entry.id)) {
+        const c = classify(entry.email, []);
+        items.push({ email: entry.email, c, url: entry.url, msgId: entry.id, job: extractJobInfo([entry.email.subject, entry.email.snippet], "", c.role) });
+      }
+    }
+
+    let skippedByPrefs = 0;
+    const suggestions = buildSuggestions(items, apps, Date.now(), { prefs: settings.jobPrefs, onSkip: () => skippedByPrefs++ });
+
+    // Don't resurrect suggestions the user already accepted or dismissed.
+    const existing = await db.suggestions.bulkGet(suggestions.map((s) => s.id));
+    const toSave = suggestions.filter((_, i) => !existing[i] || existing[i]!.state === "pending");
+
+    const summary: ScanSummary = {
+      at: Date.now(),
+      checked: entries.length,
+      relevant: toSave.map((s) => ({ title: s.changes.role || s.jobTitle || "", company: s.company, match: s.match || "" })),
+      skippedByPrefs,
+      skippedOther: items.filter((i) => !i.c.relevant).length,
+    };
+    await db.transaction("rw", db.suggestions, db.processedMessages, db.kv, async () => {
+      if (toSave.length) await db.suggestions.bulkPut(toSave);
+      const ids = entries.map((e) => e.id);
+      await db.processedMessages.bulkUpdate(ids.map((key) => ({ key, changes: { done: true } })));
+      await setKV("lastScanAt", summary.at);
+      await setKV("lastScanSummary", summary);
+    });
+    scanLog(`Gmail scan completed: ${toSave.length} relevant job(s), ${getRequestCount()} Gmail request(s)`);
+    return summary;
+  } finally {
+    cancelPendingRequests();
+    scanRunning = false;
   }
+}
 
-  const apps = await db.applications.toArray();
-  const suggestions = buildSuggestions(items, apps);
-  const now = Date.now();
-  await db.transaction("rw", db.suggestions, db.handled, db.kv, async () => {
-    if (suggestions.length) await db.suggestions.bulkPut(suggestions);
-    await db.handled.bulkPut(fresh.map((threadId) => ({ threadId, at: now })));
-    await setKV("lastScanAt", now);
-  });
-
-  return { checked: fresh.length, suggestions: suggestions.length, skipped: items.filter((i) => !i.c.relevant).length };
+/** Forget which emails were read, so the next scan looks at everything in the window again. */
+export async function resetScanHistory(): Promise<void> {
+  await Promise.all([db.processedMessages.clear(), db.handled.clear(), setKV("lastScanAt", 0), setKV("lastScanSummary", null)]);
 }
 
 /** Human label for what a suggestion changes, e.g. "→ Rejected · due 28 Sep". */

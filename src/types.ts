@@ -36,6 +36,24 @@ export interface Suggestion {
   state: SuggestionState;
   createdAt: number;
   decidedAt?: number;
+  // Added in v1.1 (optional, so suggestions saved by v1.0 still load)
+  match?: "strong" | "possible" | "tracked";
+  matchScore?: number;
+  matchReason?: string;
+  category?: string;
+  jobTitle?: string;
+  employment?: string[];
+  location?: string;
+  jobUrl?: string;
+}
+
+/** Result of the last Gmail scan, cached so repeat clicks don't re-scan. */
+export interface ScanSummary {
+  at: number;
+  checked: number; // new messages read this scan
+  relevant: { title: string; company: string; match: string }[];
+  skippedByPrefs: number;
+  skippedOther: number;
 }
 
 /** One email as the classifier sees it. */
@@ -50,6 +68,9 @@ export interface EmailInput {
 
 export interface Settings {
   clientId: string;
-  skipKeywords: string[];
   firstScanDays: number;
+  maxEmails: number;
+  jobPrefs: JobPreferences;
 }
+
+import type { JobPreferences } from "./jobs/preferences";
